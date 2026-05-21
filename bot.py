@@ -10,10 +10,6 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 FAL_KEY = os.environ.get("FAL_KEY")
 
-os.environ["FAL_KEY"] = "#"
-
-TELEGRAM_TOKEN = "#"
-
 # ─── Limit Per User ───
 user_usage = {}
 IMAGE_LIMIT = 1000
