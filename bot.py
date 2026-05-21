@@ -12,7 +12,7 @@ FAL_KEY = os.environ.get("FAL_KEY")
 
 # ─── Limit Per User ───
 user_usage = {}
-IMAGE_LIMIT = 1000
+IMAGE_LIMIT = 200
 
 def get_usage(user_id):
     if user_id not in user_usage:
