@@ -1,141 +1,257 @@
 import os
-import fal_client
-import tempfile
-import requests
-import io
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler
+import logging
+import base64
+from telegram import Update, BotCommand
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes
+)
+import anthropic
+from datetime import datetime
 
+# ── Logging ──────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-FAL_KEY = os.environ.get("FAL_KEY")
+# ── Config ───────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+MONTHLY_CHAT_LIMIT = int(os.environ.get("MONTHLY_CHAT_LIMIT", 100))
 
-# ─── Limit Per User ───
-user_usage = {}
-IMAGE_LIMIT = 200
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-def get_usage(user_id):
+# ── In-memory usage tracker (ganti dgn DB utk production) ─
+user_usage: dict[int, dict] = {}
+
+def get_usage(user_id: int) -> dict:
+    now = datetime.now()
     if user_id not in user_usage:
-        user_usage[user_id] = {"image": 0}
-    return user_usage[user_id]
+        user_usage[user_id] = {"count": 0, "month": now.month, "year": now.year}
+    u = user_usage[user_id]
+    # Reset kalau bulan baru
+    if u["month"] != now.month or u["year"] != now.year:
+        u["count"] = 0
+        u["month"] = now.month
+        u["year"] = now.year
+    return u
 
-def check_limit(user_id):
-    return get_usage(user_id)["image"] < IMAGE_LIMIT
-
-def increment_usage(user_id):
-    get_usage(user_id)
-    user_usage[user_id]["image"] += 1
-
-# ─── Upload gambar ke fal ───
-async def upload_image_to_fal(update: Update, context):
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    response = requests.get(file.file_path)
-
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
-
-    image_url = fal_client.upload_file(tmp_path)
-    os.remove(tmp_path)
-    return image_url
-
-# ─── Generate Image ───
-def generate_image(prompt, image_urls):
-    def on_queue_update(update):
-        if isinstance(update, fal_client.InProgress):
-            for log in update.logs:
-                print(log["message"])
-
-    result = fal_client.subscribe(
-        "fal-ai/bytedance/seedream/v4.5/edit",
-        arguments={
-            "prompt": prompt,
-            "image_urls": image_urls
-        },
-        with_logs=True,
-        on_queue_update=on_queue_update,
-    )
-    return result
-
-# ─── Handler /start ───
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎨 *Image Edit Bot*\n\n"
-        "Hantar gambar dengan caption sebagai prompt!\n\n"
-        "Contoh:\n"
-        "• Hantar gambar + caption `replace background with sunset`\n"
-        "• Hantar gambar + caption `make it look like winter`\n\n"
-        "📊 Semak usage: /usage",
-        parse_mode="Markdown"
-    )
-
-# ─── Handler /usage ───
-async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+def increment_usage(user_id: int):
     u = get_usage(user_id)
-    await update.message.reply_text(
-        f"📊 *Usage Awak:*\n\n"
-        f"🎨 Image: {u['image']}/{IMAGE_LIMIT}",
-        parse_mode="Markdown"
+    u["count"] += 1
+
+def is_limit_reached(user_id: int) -> bool:
+    return get_usage(user_id)["count"] >= MONTHLY_CHAT_LIMIT
+
+# ── System Prompt ─────────────────────────────────────────
+SYSTEM_PROMPT = """Kamu adalah ScamDetect AI — pakar forensik penipuan digital untuk pasaran Malaysia.
+
+TUGAS UTAMA:
+1. DETECT SCAMMER DARI CHAT/TEKS
+   - Kenal pasti asal negara/wilayah scammer berdasarkan:
+     * Corak bahasa, ejaan, tatabahasa
+     * Slanga atau perkataan unik
+     * Struktur ayat dan gaya penulisan
+   - Senaraikan red flags penipuan yang ditemui
+   - Berikan tahap risiko: RENDAH / SEDERHANA / TINGGI / KRITIKAL
+
+2. DETECT RESIT/CEKUE BANK PALSU (dari gambar)
+   - Semak ketulenan resit bank, slip pembayaran, cekue
+   - Kenal pasti tanda-tanda pemalsuan:
+     * Font tidak konsisten
+     * Watermark atau logo tidak betul
+     * Nombor akaun, tarikh, atau jumlah yang mencurigakan
+     * Kualiti imej atau cetakan
+   - PENTING: Jika resit/cekue mencurigakan atau palsu:
+     * Beritahu pemilik untuk TUNGGU 5-10 hari bekerja sebelum release barang/perkhidmatan
+     * Selepas tempoh tersebut, hubungi bank untuk pengesahan muktamad
+     * Jangan sesekali percaya 100% pada resit sebelum pengesahan bank
+
+FORMAT JAWAPAN:
+🔍 ANALISIS: [ringkasan]
+🌍 ASAL SCAMMER: [negara/wilayah jika berkaitan]
+⚠️ RED FLAGS: [senarai]
+🎯 TAHAP RISIKO: [RENDAH/SEDERHANA/TINGGI/KRITIKAL]
+💡 NASIHAT: [tindakan yang perlu diambil]
+
+Sentiasa jawab dalam Bahasa Malaysia. Bersikap tegas tapi profesional."""
+
+# ── Handlers ─────────────────────────────────────────────
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 *Selamat datang ke ScamDetect AI!*\n\n"
+        "Saya boleh membantu anda:\n"
+        "📱 *Detect scammer* dari screenshot chat\n"
+        "🧾 *Semak resit/cekue* bank palsu atau sebenar\n\n"
+        "Cara guna:\n"
+        "• Hantar *teks/screenshot chat* — saya akan detect scammer\n"
+        "• Hantar *gambar resit/cekue* — saya akan semak ketulenan\n\n"
+        f"⚡ Had: *{MONTHLY_CHAT_LIMIT} analisis/bulan*\n\n"
+        "Taip /status untuk semak baki analisis anda."
     )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-# ─── Handler gambar + caption ───
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = get_usage(uid)
+    remaining = MONTHLY_CHAT_LIMIT - u["count"]
+    text = (
+        f"📊 *Status Penggunaan Anda*\n\n"
+        f"✅ Digunakan: {u['count']}/{MONTHLY_CHAT_LIMIT}\n"
+        f"🔋 Baki: {remaining} analisis\n"
+        f"📅 Reset: Awal bulan depan"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-    # Semak ada caption tak
-    prompt = update.message.caption
-    if not prompt:
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📖 *Panduan ScamDetect AI*\n\n"
+        "*Untuk detect scammer:*\n"
+        "Hantar teks atau screenshot percakapan yang mencurigakan\n\n"
+        "*Untuk semak resit/cekue:*\n"
+        "Hantar gambar resit bank, slip pembayaran, atau cekue\n\n"
+        "*Peringatan penting:*\n"
+        "⏳ Untuk resit/cekue — tunggu 5-10 hari bekerja sebelum release barang\n"
+        "📞 Hubungi bank untuk pengesahan muktamad\n\n"
+        "*Commands:*\n"
+        "/start — Mulakan bot\n"
+        "/status — Semak baki analisis\n"
+        "/help — Panduan penggunaan"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def analyze_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    if is_limit_reached(uid):
         await update.message.reply_text(
-            "⚠️ Sila hantar gambar dengan caption sebagai prompt!\n\n"
-            "Contoh: hantar gambar + caption `replace background with sunset`"
+            "❌ *Had bulanan anda telah habis.*\n\n"
+            "Had anda akan reset pada awal bulan depan.\n"
+            "Hubungi admin untuk naik taraf pelan.",
+            parse_mode="Markdown"
         )
         return
 
-    if not check_limit(user_id):
-        await update.message.reply_text(f"❌ Had image awak dah penuh! ({IMAGE_LIMIT} gambar)")
-        return
-
-    await update.message.reply_text("⏳ Sedang proses gambar...")
+    user_text = update.message.text
+    thinking_msg = await update.message.reply_text("🔍 *Menganalisis teks...* Sila tunggu.", parse_mode="Markdown")
 
     try:
-        # Upload gambar
-        image_url = await upload_image_to_fal(update, context)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"Sila analisis teks/chat berikut untuk detect penipuan:\n\n{user_text}"
+            }]
+        )
+        result = response.content[0].text
+        increment_usage(uid)
+        u = get_usage(uid)
+        remaining = MONTHLY_CHAT_LIMIT - u["count"]
 
-        # Terus generate
-        result = generate_image(prompt, [image_url])
-        img_url = result["images"][0]["url"]
+        await thinking_msg.edit_text(
+            f"{result}\n\n─────────────────\n"
+            f"🔋 Baki analisis: {remaining}/{MONTHLY_CHAT_LIMIT}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error analyzing text: {e}")
+        await thinking_msg.edit_text("⚠️ Ralat semasa menganalisis. Sila cuba lagi.")
 
-        increment_usage(user_id)
-        u = get_usage(user_id)
+async def analyze_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
 
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=img_url,
-            caption=f"✨ {prompt}\n\n🎨 {u['image']}/{IMAGE_LIMIT}"
+    if is_limit_reached(uid):
+        await update.message.reply_text(
+            "❌ *Had bulanan anda telah habis.*\n\n"
+            "Had anda akan reset pada awal bulan depan.",
+            parse_mode="Markdown"
+        )
+        return
+
+    thinking_msg = await update.message.reply_text("🔍 *Menganalisis gambar...* Sila tunggu.", parse_mode="Markdown")
+
+    try:
+        # Ambil gambar resolusi tertinggi
+        photo = update.message.photo[-1] if update.message.photo else None
+        document = update.message.document if update.message.document else None
+
+        if photo:
+            file = await ctx.bot.get_file(photo.file_id)
+        elif document and document.mime_type and document.mime_type.startswith("image/"):
+            file = await ctx.bot.get_file(document.file_id)
+        else:
+            await thinking_msg.edit_text("⚠️ Sila hantar gambar yang sah (JPG/PNG).")
+            return
+
+        # Download gambar
+        file_bytes = await file.download_as_bytearray()
+        image_b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+
+        caption = update.message.caption or ""
+        user_prompt = (
+            f"Sila analisis gambar resit/cekue/dokumen ini untuk detect penipuan."
+            + (f"\nNota tambahan dari pengguna: {caption}" if caption else "")
+        )
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": user_prompt
+                    }
+                ]
+            }]
+        )
+
+        result = response.content[0].text
+        increment_usage(uid)
+        u = get_usage(uid)
+        remaining = MONTHLY_CHAT_LIMIT - u["count"]
+
+        await thinking_msg.edit_text(
+            f"{result}\n\n─────────────────\n"
+            f"🔋 Baki analisis: {remaining}/{MONTHLY_CHAT_LIMIT}",
+            parse_mode="Markdown"
         )
 
     except Exception as e:
-        print("Error:", e)
-        await update.message.reply_text(f"❌ Gagal proses gambar.\n\nError: {e}")
+        logger.error(f"Error analyzing image: {e}")
+        await thinking_msg.edit_text("⚠️ Ralat semasa menganalisis gambar. Sila cuba lagi.")
 
-# ─── Handler teks biasa ───
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📸 Hantar gambar dengan caption untuk edit!\n\n"
-        "Contoh: hantar gambar + caption `replace background with sunset`"
-    )
+# ── Main ──────────────────────────────────────────────────
 
-# ─── Run Bot ───
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("usage", usage))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("Image Bot berjalan...")
-    app.run_polling()
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("help", help_cmd))
+
+    # Messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_text))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, analyze_image))
+
+    logger.info("🤖 ScamDetect Bot started...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
